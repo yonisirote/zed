@@ -6103,7 +6103,6 @@ impl ProjectGroupKey {
         self.host.clone()
     }
 }
-
 pub struct PathMatchCandidateSet {
     pub snapshot: Snapshot,
     pub include_ignored: bool,

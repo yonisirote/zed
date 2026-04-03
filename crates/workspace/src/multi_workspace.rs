@@ -497,7 +497,6 @@ impl MultiWorkspace {
         }
         groups.into_iter()
     }
-
     pub fn workspace(&self) -> &Entity<Workspace> {
         &self.workspaces[self.active_workspace_index]
     }
