@@ -17,8 +17,8 @@ use chrono::{DateTime, Utc};
 use editor::Editor;
 use feature_flags::{AgentV2FeatureFlag, FeatureFlagViewExt as _};
 use gpui::{
-    Action as _, AnyElement, App, Context, Entity, FocusHandle, Focusable, KeyContext, ListState,
-    Pixels, Render, SharedString, WeakEntity, Window, WindowHandle, linear_color_stop,
+    Action as _, AnyElement, App, ClickEvent, Context, Entity, FocusHandle, Focusable, KeyContext,
+    ListState, Pixels, Render, SharedString, WeakEntity, Window, WindowHandle, linear_color_stop,
     linear_gradient, list, prelude::*, px,
 };
 use menu::{
@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings as _;
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::path::PathBuf;
 use std::rc::Rc;
 use theme::ActiveTheme;
 use ui::{
@@ -46,8 +47,8 @@ use util::ResultExt as _;
 use util::path_list::{PathList, SerializedPathList};
 use workspace::{
     AddFolderToProject, CloseWindow, FocusWorkspaceSidebar, MultiWorkspace, MultiWorkspaceEvent,
-    Open, Sidebar as WorkspaceSidebar, SidebarSide, ToggleWorkspaceSidebar, Workspace, WorkspaceId,
-    sidebar_side_context_menu,
+    Open, Sidebar as WorkspaceSidebar, SidebarSide, Toast, ToggleWorkspaceSidebar, Workspace,
+    WorkspaceId, notifications::NotificationId, sidebar_side_context_menu,
 };
 
 use zed_actions::OpenRecent;
@@ -2279,13 +2280,13 @@ impl Sidebar {
                 });
             })?;
 
-            let mut restored_path = None;
+            let mut path_replacements: Vec<(PathBuf, PathBuf)> = Vec::new();
             for row in &archived_worktrees {
                 match thread_worktree_archive::restore_worktree_via_git(row, &mut *cx).await {
-                    Ok(path) => {
+                    Ok(restored_path) => {
                         thread_worktree_archive::cleanup_archived_worktree_record(row, &mut *cx)
                             .await;
-                        restored_path = Some(path);
+                        path_replacements.push((row.worktree_path.clone(), restored_path));
                     }
                     Err(error) => {
                         log::error!("Failed to restore worktree: {error:#}");
@@ -2294,17 +2295,32 @@ impl Sidebar {
                                 store.set_pending_worktree_restore(&session_id, None, cx);
                             });
                         })?;
+                        this.update_in(cx, |this, _window, cx| {
+                            if let Some(multi_workspace) = this.multi_workspace.upgrade() {
+                                let workspace = multi_workspace.read(cx).workspace().clone();
+                                workspace.update(cx, |workspace, cx| {
+                                    struct RestoreWorktreeErrorToast;
+                                    workspace.show_toast(
+                                        Toast::new(
+                                            NotificationId::unique::<RestoreWorktreeErrorToast>(),
+                                            format!("Failed to restore worktree: {error:#}"),
+                                        )
+                                        .autohide(),
+                                        cx,
+                                    );
+                                });
+                            }
+                        })
+                        .ok();
                         return anyhow::Ok(());
                     }
                 }
             }
 
-            if let Some(path) = restored_path {
-                let new_paths = PathList::new(std::slice::from_ref(&path));
-
+            if !path_replacements.is_empty() {
                 cx.update(|_window, cx| {
                     store.update(cx, |store, cx| {
-                        store.complete_worktree_restore(&session_id, new_paths.clone(), cx);
+                        store.complete_worktree_restore(&session_id, &path_replacements, cx);
                     });
                 })?;
 
@@ -2312,6 +2328,7 @@ impl Sidebar {
                     cx.update(|_window, cx| store.read(cx).entry(&session_id).cloned())?;
 
                 if let Some(updated_metadata) = updated_metadata {
+                    let new_paths = updated_metadata.folder_paths.clone();
                     this.update_in(cx, |this, window, cx| {
                         this.open_workspace_and_activate_thread(
                             updated_metadata,
@@ -2949,6 +2966,17 @@ impl Sidebar {
                     .collect(),
             )
             .pending_worktree_restore(thread.metadata.pending_worktree_restore.is_some())
+            .when(thread.metadata.pending_worktree_restore.is_some(), |this| {
+                let session_id = thread.metadata.session_id.clone();
+                this.on_cancel_restore(cx.listener(
+                    move |_this, _event: &ClickEvent, _window, cx| {
+                        let store = ThreadMetadataStore::global(cx);
+                        store.update(cx, |store, cx| {
+                            store.set_pending_worktree_restore(&session_id, None, cx);
+                        });
+                    },
+                ))
+            })
             .timestamp(timestamp)
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(thread.is_title_generating)

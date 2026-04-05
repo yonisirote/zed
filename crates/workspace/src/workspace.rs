@@ -8723,6 +8723,22 @@ pub async fn restore_multiworkspace(
             .ok();
     }
 
+    if !state.project_group_keys.is_empty() {
+        window_handle
+            .update(cx, |multi_workspace, _window, _cx| {
+                for serialized_key in &state.project_group_keys {
+                    let paths = PathList::deserialize(&serialized_key.path_list);
+                    let host = match &serialized_key.location {
+                        SerializedWorkspaceLocation::Local => None,
+                        SerializedWorkspaceLocation::Remote(opts) => Some(opts.clone()),
+                    };
+                    let key = ProjectGroupKey::new(host, paths);
+                    multi_workspace.add_project_group_key(key);
+                }
+            })
+            .ok();
+    }
+
     if state.sidebar_open {
         window_handle
             .update(cx, |multi_workspace, _, cx| {
