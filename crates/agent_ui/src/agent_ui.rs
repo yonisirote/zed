@@ -28,11 +28,11 @@ mod terminal_codegen;
 mod terminal_inline_assistant;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
-pub mod thread_worktree_archive;
 mod thread_history;
 mod thread_history_view;
 mod thread_import;
 pub mod thread_metadata_store;
+pub mod thread_worktree_archive;
 pub mod threads_archive_view;
 mod ui;
 
