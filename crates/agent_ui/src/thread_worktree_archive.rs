@@ -7,17 +7,19 @@ use std::{
 use agent_client_protocol as acp;
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
-use git::repository::{AskPassDelegate, CommitOptions, ResetMode};
+use git::repository::{AskPassDelegate, CommitOptions, DEFAULT_WORKTREE_DIRECTORY, ResetMode};
 use gpui::{App, AsyncApp, Entity, Global, Task, WindowHandle};
 use parking_lot::Mutex;
-use project::{LocalProjectFlags, Project, WorktreeId, git_store::Repository};
+use project::{
+    LocalProjectFlags, Project, WorktreeId, git_store::Repository, worktrees_directory_for_repo,
+};
 use util::ResultExt;
 use workspace::{
     AppState, MultiWorkspace, OpenMode, OpenOptions, PathList, Toast, Workspace,
     notifications::NotificationId, open_new, open_paths,
 };
 
-use crate::thread_metadata_store::ThreadMetadataStore;
+use crate::thread_metadata_store::{ArchivedGitWorktree, ThreadMetadataStore};
 
 #[derive(Default)]
 pub struct ThreadArchiveCleanupCoordinator {
@@ -578,7 +580,7 @@ async fn remove_root_after_worktree_removal(
         task.await?;
     }
 
-    let (repo, _temp_project) = repository_for_root_removal(root, cx).await?;
+    let (repo, _temp_project) = find_or_create_repository(&root.main_repo_path, cx).await?;
     let receiver = repo.update(cx, |repo: &mut Repository, _cx| {
         repo.remove_worktree(root.root_path.clone(), false)
     });
@@ -588,10 +590,24 @@ async fn remove_root_after_worktree_removal(
     result
 }
 
-async fn repository_for_root_removal(
-    root: &RootPlan,
+/// Finds a live `Repository` entity for the given path, or creates a temporary
+/// `Project::local` to obtain one.
+///
+/// `Repository` entities can only be obtained through a `Project` because
+/// `GitStore` (which creates and manages `Repository` entities) is owned by
+/// `Project`. When no open workspace contains the repo we need, we spin up a
+/// headless `Project::local` just to get a `Repository` handle. The caller
+/// keeps the returned `Option<Entity<Project>>` alive for the duration of the
+/// git operations, then drops it.
+///
+/// Future improvement: decoupling `GitStore` from `Project` so that
+/// `Repository` entities can be created standalone would eliminate this
+/// temporary-project workaround.
+async fn find_or_create_repository(
+    repo_path: &Path,
     cx: &mut AsyncApp,
 ) -> Result<(Entity<Repository>, Option<Entity<Project>>)> {
+    let repo_path_owned = repo_path.to_path_buf();
     let live_repo = cx.update(|cx| {
         all_open_workspaces(cx)
             .into_iter()
@@ -607,7 +623,7 @@ async fn repository_for_root_removal(
             })
             .find(|repo| {
                 repo.read(cx).snapshot().work_directory_abs_path.as_ref()
-                    == root.main_repo_path.as_path()
+                    == repo_path_owned.as_path()
             })
     });
 
@@ -630,13 +646,15 @@ async fn repository_for_root_removal(
         )
     });
 
+    let repo_path_for_worktree = repo_path.to_path_buf();
     let create_worktree = temp_project.update(cx, |project, cx| {
-        project.create_worktree(root.main_repo_path.clone(), true, cx)
+        project.create_worktree(repo_path_for_worktree, true, cx)
     });
     let _worktree = create_worktree.await?;
     let initial_scan = temp_project.read_with(cx, |project, cx| project.wait_for_initial_scan(cx));
     initial_scan.await;
 
+    let repo_path_for_find = repo_path.to_path_buf();
     let repo = temp_project
         .update(cx, |project, cx| {
             project
@@ -644,11 +662,11 @@ async fn repository_for_root_removal(
                 .values()
                 .find(|repo| {
                     repo.read(cx).snapshot().work_directory_abs_path.as_ref()
-                        == root.main_repo_path.as_path()
+                        == repo_path_for_find.as_path()
                 })
                 .cloned()
         })
-        .context("failed to resolve temporary main repository handle")?;
+        .context("failed to resolve temporary repository handle")?;
 
     let barrier = repo.update(cx, |repo: &mut Repository, _cx| repo.barrier());
     barrier
@@ -811,7 +829,7 @@ async fn persist_worktree_state(
 
     // Step 7: Create git ref on main repo (non-fatal)
     let ref_name = archived_worktree_ref_name(archived_worktree_id);
-    let main_repo_result = repository_for_root_removal(root, cx).await;
+    let main_repo_result = find_or_create_repository(&root.main_repo_path, cx).await;
     match main_repo_result {
         Ok((main_repo, _temp_project)) => {
             let rx = main_repo.update(cx, |repo, _cx| {
@@ -851,7 +869,9 @@ async fn rollback_persist(outcome: &PersistOutcome, root: &RootPlan, cx: &mut As
     }
 
     // Delete the git ref on main repo
-    if let Ok((main_repo, _temp_project)) = repository_for_root_removal(root, cx).await {
+    if let Ok((main_repo, _temp_project)) =
+        find_or_create_repository(&root.main_repo_path, cx).await
+    {
         let ref_name = archived_worktree_ref_name(outcome.archived_worktree_id);
         let rx = main_repo.update(cx, |repo, _cx| repo.delete_ref(ref_name));
         let _ = rx.await;
@@ -883,6 +903,128 @@ async fn cleanup_empty_workspaces(workspaces: &[Entity<Workspace>], cx: &mut Asy
             }
         });
     }
+}
+
+pub async fn restore_worktree_via_git(
+    row: &ArchivedGitWorktree,
+    cx: &mut AsyncApp,
+) -> Result<PathBuf> {
+    // Step 1: Find the main repo entity
+    let (main_repo, _temp_project) = find_or_create_repository(&row.main_repo_path, cx).await?;
+
+    // Step 2: Handle path conflicts
+    let worktree_path = &row.worktree_path;
+    let app_state = current_app_state(cx).context("no app state available")?;
+    let already_exists = app_state.fs.metadata(worktree_path).await?.is_some();
+
+    let final_path = if already_exists {
+        let worktree_directory =
+            worktrees_directory_for_repo(&row.main_repo_path, DEFAULT_WORKTREE_DIRECTORY)?;
+        let new_name = format!(
+            "{}-restored-{}",
+            row.branch_name.as_deref().unwrap_or("worktree"),
+            row.id
+        );
+        let project_name = row
+            .main_repo_path
+            .file_name()
+            .context("git repo must have a directory name")?;
+        worktree_directory.join(&new_name).join(project_name)
+    } else {
+        worktree_path.clone()
+    };
+
+    // Step 3: Create detached worktree
+    let rx = main_repo.update(cx, |repo, _cx| {
+        repo.create_worktree_detached(final_path.clone(), row.commit_hash.clone())
+    });
+    rx.await
+        .map_err(|_| anyhow!("worktree creation was canceled"))?
+        .context("failed to create worktree")?;
+
+    // Step 4: Get the worktree's repo entity
+    let (wt_repo, _temp_wt_project) = find_or_create_repository(&final_path, cx).await?;
+
+    // Step 5: Mixed reset HEAD~ (undo the "WIP unstaged" commit)
+    let rx = wt_repo.update(cx, |repo, cx| {
+        repo.reset("HEAD~".to_string(), ResetMode::Mixed, cx)
+    });
+    match rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = wt_repo
+                .update(cx, |repo, cx| {
+                    repo.reset(row.commit_hash.clone(), ResetMode::Mixed, cx)
+                })
+                .await;
+            return Err(error.context("mixed reset failed while restoring worktree"));
+        }
+        Err(_) => {
+            return Err(anyhow!("mixed reset was canceled"));
+        }
+    }
+
+    // Step 6: Soft reset HEAD~ (undo the "WIP staged" commit)
+    let rx = wt_repo.update(cx, |repo, cx| {
+        repo.reset("HEAD~".to_string(), ResetMode::Soft, cx)
+    });
+    match rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = wt_repo
+                .update(cx, |repo, cx| {
+                    repo.reset(row.commit_hash.clone(), ResetMode::Mixed, cx)
+                })
+                .await;
+            return Err(error.context("soft reset failed while restoring worktree"));
+        }
+        Err(_) => {
+            return Err(anyhow!("soft reset was canceled"));
+        }
+    }
+
+    // Step 7: Restore the branch
+    if let Some(branch_name) = &row.branch_name {
+        let rx = wt_repo.update(cx, |repo, _cx| repo.change_branch(branch_name.clone()));
+        match rx.await {
+            Ok(Ok(())) => {}
+            _ => {
+                let rx = wt_repo.update(cx, |repo, _cx| {
+                    repo.create_branch(branch_name.clone(), None)
+                });
+                if let Ok(Err(_)) | Err(_) = rx.await {
+                    log::warn!(
+                        "Could not switch to branch '{}' — \
+                         restored worktree is in detached HEAD state.",
+                        branch_name
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(final_path)
+}
+
+pub async fn cleanup_archived_worktree_record(row: &ArchivedGitWorktree, cx: &mut AsyncApp) {
+    // Delete the git ref from the main repo
+    if let Ok((main_repo, _temp_project)) = find_or_create_repository(&row.main_repo_path, cx).await
+    {
+        let ref_name = archived_worktree_ref_name(row.id);
+        let rx = main_repo.update(cx, |repo, _cx| repo.delete_ref(ref_name));
+        match rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log::warn!("Failed to delete archive ref: {error}"),
+            Err(_) => log::warn!("Archive ref deletion was canceled"),
+        }
+    }
+
+    // Delete the DB records
+    let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+    store
+        .read_with(cx, |store, cx| store.delete_archived_worktree(row.id, cx))
+        .await
+        .log_err();
 }
 
 fn show_error_toast(summary: &str, detail: &str, plan: &CleanupPlan, cx: &mut AsyncApp) {

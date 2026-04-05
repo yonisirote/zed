@@ -502,6 +502,7 @@ fn collect_importable_threads(
                 folder_paths,
                 main_worktree_paths: PathList::default(),
                 archived: true,
+                pending_worktree_restore: None,
             });
         }
     }

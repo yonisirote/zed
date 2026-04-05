@@ -71,6 +71,7 @@ fn migrate_thread_metadata(cx: &mut App) {
                         folder_paths: entry.folder_paths,
                         main_worktree_paths: PathList::default(),
                         archived: true,
+                        pending_worktree_restore: None,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -132,6 +133,10 @@ pub struct ThreadMetadata {
     pub folder_paths: PathList,
     pub main_worktree_paths: PathList,
     pub archived: bool,
+    /// When set, the thread's original worktree is being restored in the background.
+    /// The PathBuf is the main repo path shown temporarily while restoration is pending.
+    /// This is runtime-only state — not persisted to the database.
+    pub pending_worktree_restore: Option<PathBuf>,
 }
 
 impl From<&ThreadMetadata> for acp_thread::AgentSessionInfo {
@@ -406,6 +411,34 @@ impl ThreadMetadataStore {
 
     pub fn unarchive(&mut self, session_id: &acp::SessionId, cx: &mut Context<Self>) {
         self.update_archived(session_id, false, cx);
+    }
+
+    pub fn set_pending_worktree_restore(
+        &mut self,
+        session_id: &acp::SessionId,
+        main_repo_path: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(thread) = self.threads.get_mut(session_id) {
+            thread.pending_worktree_restore = main_repo_path;
+            cx.notify();
+        }
+    }
+
+    pub fn complete_worktree_restore(
+        &mut self,
+        session_id: &acp::SessionId,
+        new_folder_paths: PathList,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(thread) = self.threads.get(session_id).cloned() {
+            self.save_internal(ThreadMetadata {
+                pending_worktree_restore: None,
+                folder_paths: new_folder_paths,
+                ..thread
+            });
+            cx.notify();
+        }
     }
 
     pub fn create_archived_worktree(
@@ -697,6 +730,7 @@ impl ThreadMetadataStore {
                     folder_paths,
                     main_worktree_paths,
                     archived,
+                    pending_worktree_restore: None,
                 };
 
                 self.save(metadata, cx);
@@ -995,6 +1029,7 @@ impl Column for ThreadMetadata {
                 folder_paths,
                 main_worktree_paths,
                 archived,
+                pending_worktree_restore: None,
             },
             next,
         ))
@@ -1074,6 +1109,7 @@ mod tests {
             created_at: Some(updated_at),
             folder_paths,
             main_worktree_paths: PathList::default(),
+            pending_worktree_restore: None,
         }
     }
 
@@ -1291,6 +1327,7 @@ mod tests {
             folder_paths: project_a_paths.clone(),
             main_worktree_paths: PathList::default(),
             archived: false,
+            pending_worktree_restore: None,
         };
 
         cx.update(|cx| {
@@ -1401,6 +1438,7 @@ mod tests {
             folder_paths: project_paths.clone(),
             main_worktree_paths: PathList::default(),
             archived: false,
+            pending_worktree_restore: None,
         };
 
         cx.update(|cx| {
@@ -2351,6 +2389,7 @@ mod tests {
             folder_paths: paths.clone(),
             main_worktree_paths: PathList::default(),
             archived: false,
+            pending_worktree_restore: None,
         };
         let meta2 = ThreadMetadata {
             session_id: acp::SessionId::new("session-2"),
@@ -2361,6 +2400,7 @@ mod tests {
             folder_paths: paths.clone(),
             main_worktree_paths: PathList::default(),
             archived: true,
+            pending_worktree_restore: None,
         };
 
         store.update(cx, |store, _cx| {

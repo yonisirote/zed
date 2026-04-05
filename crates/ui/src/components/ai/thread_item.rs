@@ -46,6 +46,7 @@ pub struct ThreadItem {
     project_paths: Option<Arc<[PathBuf]>>,
     project_name: Option<SharedString>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
+    pending_worktree_restore: bool,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
     action_slot: Option<AnyElement>,
@@ -78,6 +79,7 @@ impl ThreadItem {
             project_paths: None,
             project_name: None,
             worktrees: Vec::new(),
+            pending_worktree_restore: false,
             on_click: None,
             on_hover: Box::new(|_, _, _| {}),
             action_slot: None,
@@ -168,6 +170,11 @@ impl ThreadItem {
 
     pub fn worktrees(mut self, worktrees: Vec<ThreadItemWorktreeInfo>) -> Self {
         self.worktrees = worktrees;
+        self
+    }
+
+    pub fn pending_worktree_restore(mut self, pending: bool) -> Self {
+        self.pending_worktree_restore = pending;
         self
     }
 
@@ -359,7 +366,7 @@ impl RenderOnce for ThreadItem {
 
         let has_project_name = self.project_name.is_some();
         let has_project_paths = project_paths.is_some();
-        let has_worktree = !self.worktrees.is_empty();
+        let has_worktree = !self.worktrees.is_empty() || self.pending_worktree_restore;
         let has_timestamp = !self.timestamp.is_empty();
         let timestamp = self.timestamp;
 
@@ -484,6 +491,29 @@ impl RenderOnce for ThreadItem {
                                         cx,
                                     )
                                 })
+                                .into_any_element(),
+                        );
+                    }
+
+                    if self.pending_worktree_restore {
+                        worktree_labels.push(
+                            h_flex()
+                                .id(format!("{}-worktree-restore", self.id.clone()))
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::LoadCircle)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted)
+                                        .with_rotate_animation(2),
+                                )
+                                .child(
+                                    Label::new("Restoring worktree\u{2026}")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .tooltip(Tooltip::text(
+                                    "Restoring the Git worktree for this thread",
+                                ))
                                 .into_any_element(),
                         );
                     }
