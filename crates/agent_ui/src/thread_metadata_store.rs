@@ -2492,7 +2492,7 @@ mod tests {
         let store = cx.update(|cx| ThreadMetadataStore::global(cx));
 
         let original_paths = PathList::new(&[Path::new("/projects/worktree-a")]);
-        let meta = make_metadata("session-1", "Thread 1", Utc::now(), original_paths.clone());
+        let meta = make_metadata("session-1", "Thread 1", Utc::now(), original_paths);
 
         store.update(cx, |store, cx| {
             store.save_manually(meta, cx);
@@ -2513,7 +2513,7 @@ mod tests {
         let entry = entry.unwrap();
         assert!(entry.pending_worktree_restore.is_none());
         assert_eq!(
-            entry.folder_paths.paths().as_ref(),
+            entry.folder_paths.paths(),
             &[PathBuf::from("/projects/worktree-a-restored")]
         );
     }
@@ -2669,7 +2669,7 @@ mod tests {
 
         let wt_a = worktrees
             .iter()
-            .find(|w| w.worktree_path == PathBuf::from("/projects/worktree-a"))
+            .find(|w| w.worktree_path.as_path() == Path::new("/projects/worktree-a"))
             .unwrap();
         assert_eq!(wt_a.staged_commit_hash, "staged_a");
         assert_eq!(wt_a.unstaged_commit_hash, "unstaged_a");
@@ -2677,7 +2677,7 @@ mod tests {
 
         let wt_b = worktrees
             .iter()
-            .find(|w| w.worktree_path == PathBuf::from("/projects/worktree-b"))
+            .find(|w| w.worktree_path.as_path() == Path::new("/projects/worktree-b"))
             .unwrap();
         assert_eq!(wt_b.staged_commit_hash, "staged_b");
         assert_eq!(wt_b.unstaged_commit_hash, "unstaged_b");
